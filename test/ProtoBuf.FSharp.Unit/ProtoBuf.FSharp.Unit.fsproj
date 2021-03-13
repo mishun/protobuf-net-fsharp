@@ -9,6 +9,8 @@
   <ItemGroup>
     <Content Include="app.config" />
     <Compile Include="CommonUtils.fs" />
+    <Compile Include="AutoTestTypes.fs" />
+    <Compile Include="RunAutoTest.fs" />
     <Compile Include="TestUnionRoundtrip.fs" />
     <Compile Include="TestRecordRoundtrip.fs" />
     <Compile Include="Program.fs" />

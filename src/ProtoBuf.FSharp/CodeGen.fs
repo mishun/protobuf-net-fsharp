@@ -7,7 +7,7 @@ open System.Reflection
 open System.Reflection.Emit
 open MethodHelpers
 
-let inline emitZeroValueOntoEvaluationStack (gen: ILGenerator) (getterType: MethodType) = 
+let private emitZeroValueOntoEvaluationStack (gen: ILGenerator) (getterType: MethodType) =
     match getterType with
     | MethodType.MethodInfo mi  ->
         gen.EmitCall(OpCodes.Call, mi, null) 
@@ -150,8 +150,24 @@ let private emitRecordSurrogate (surrogateModule: ModuleBuilder) (recordType: Ty
 
     surrogateType.CreateTypeInfo ()
 
+
+type private TypeBuilder with
+    member tb.DefineOpExplicit(src : Type, dst : Type) =
+        let attr = MethodAttributes.Public ||| MethodAttributes.HideBySig ||| MethodAttributes.SpecialName ||| MethodAttributes.Static
+        tb.DefineMethod("op_Explicit", attr, dst, [| src |])
+
+    member tb.SetProtoContractAttribute(useConstructor : bool) =
+        let t = typeof<ProtoBuf.ProtoContractAttribute>
+        CustomAttributeBuilder(
+            t.GetConstructor [||], [||]
+            , [| t.GetProperty "ImplicitFields" ; t.GetProperty "SkipConstructor" |]
+            , [| box ProtoBuf.ImplicitFields.AllFields ; box (not useConstructor) |]
+        ) |> tb.SetCustomAttribute
+
+
 let private emitValueUnionSurrogate (surrogateModule: ModuleBuilder) (unionType: Type) (useValueTypeSurrogate: bool) =
     let struct (surrogateType, constructor) = surrogateTypeDeclaration surrogateModule unionType useValueTypeSurrogate
+    surrogateType.SetProtoContractAttribute(false)
 
     let cases = [|
         for caseInfo in FSharpType.GetUnionCases(unionType, true) ->
@@ -168,11 +184,9 @@ let private emitValueUnionSurrogate (surrogateModule: ModuleBuilder) (unionType:
             | _ -> chooseName ("_" + name)
         surrogateType.DefineField(chooseName "__tag", typeof<int>, FieldAttributes.Public)
 
-    let attr = MethodAttributes.Public ||| MethodAttributes.HideBySig ||| MethodAttributes.SpecialName ||| MethodAttributes.Static
-
     // Define op_Implicit methods that Protobuf calls to create unionType from surrogate.
     begin
-        let conv = surrogateType.DefineMethod("op_Implicit", attr, unionType, [| surrogateType |])
+        let conv = surrogateType.DefineOpExplicit(surrogateType, unionType)
         let gen = conv.GetILGenerator()
 
         let jumpTable = Array.init (Array.length cases) (ignore >> gen.DefineLabel)
@@ -193,7 +207,7 @@ let private emitValueUnionSurrogate (surrogateModule: ModuleBuilder) (unionType:
 
     // Define op_Implicit methods that Protobuf calls to create surrogate from unionType.
     begin
-        let conv = surrogateType.DefineMethod("op_Implicit", attr, surrogateType, [| unionType |])
+        let conv = surrogateType.DefineOpExplicit(unionType, surrogateType)
         let gen = conv.GetILGenerator()
 
         let resultCell = gen.DeclareLocal(surrogateType)
@@ -232,6 +246,163 @@ let private emitValueUnionSurrogate (surrogateModule: ModuleBuilder) (unionType:
 
     surrogateType.CreateTypeInfo ()
 
+
+let private emitUnionSurrogate' (surrogateModule: ModuleBuilder) (unionType: Type) =
+    let surrogateType =
+        let name = sprintf "ProtoBuf.FSharp.Surrogates.Generated.%s" unionType.FullName
+        let attr = TypeAttributes.Public ||| TypeAttributes.Sealed ||| TypeAttributes.Serializable
+        surrogateModule.DefineType(name, attr, typeof<ValueType>)
+    surrogateType.SetProtoContractAttribute(false)
+
+
+    let caseBaseType =
+        let attr = TypeAttributes.Public ||| TypeAttributes.NestedPublic ||| TypeAttributes.Serializable
+        surrogateType.DefineNestedType("Case", attr, typeof<obj>)
+    caseBaseType.SetProtoContractAttribute(false)
+
+    let baseDefaultConstructor =
+        let ctr = caseBaseType.DefineConstructor(MethodAttributes.Public, CallingConventions.Standard, [| |])
+        let gen = ctr.GetILGenerator()
+        gen.Emit(OpCodes.Ldarg_0)
+        gen.Emit(OpCodes.Call, typeof<obj>.GetConstructor [||])
+        gen.Emit(OpCodes.Ret)
+        ctr
+
+    let extractBaseMethod =
+        let attr = MethodAttributes.Public ||| MethodAttributes.Virtual
+        let extract = caseBaseType.DefineMethod("extract", attr, unionType, [| |])
+        let gen = extract.GetILGenerator()
+        gen.Emit(OpCodes.Newobj, typeof<System.NotImplementedException>.GetConstructor [||])
+        gen.Emit(OpCodes.Throw)
+        extract
+
+    let surrogateItemField = surrogateType.DefineField("Item", caseBaseType, FieldAttributes.Public)
+
+    let surrogateConstructor =
+        let ctr = surrogateType.DefineConstructor(MethodAttributes.Public, CallingConventions.Standard, [| caseBaseType |])
+        let gen = ctr.GetILGenerator()
+        gen.Emit(OpCodes.Ldarg_0)
+        gen.Emit(OpCodes.Ldarg_1)
+        gen.Emit(OpCodes.Stfld, surrogateItemField)
+        gen.Emit(OpCodes.Ret)
+        ctr
+
+    let cases = [|
+        for caseInfo in FSharpType.GetUnionCases(unionType, true) ->
+            let subtype =
+                let attr = TypeAttributes.Public ||| TypeAttributes.NestedPublic ||| TypeAttributes.Sealed ||| TypeAttributes.Serializable
+                surrogateType.DefineNestedType("Case" + caseInfo.Name, attr, caseBaseType)
+            subtype.SetProtoContractAttribute(true)
+
+            let fields = [| for fi in caseInfo.GetFields() -> subtype.DefineField(fi.Name, fi.PropertyType, FieldAttributes.Public) |]
+
+            let constructor =
+                let parameters = fields |> Array.map (fun f -> f.FieldType)
+                let ctr = subtype.DefineConstructor(MethodAttributes.Public, CallingConventions.Standard, parameters)
+                let gen = ctr.GetILGenerator()
+                gen.Emit(OpCodes.Ldarg_0)
+                gen.Emit(OpCodes.Call, baseDefaultConstructor)
+                for (index, field) in Seq.indexed fields do
+                    gen.Emit(OpCodes.Ldarg_0)
+                    gen.Emit(OpCodes.Ldarg, 1 + index)
+                    gen.Emit(OpCodes.Stfld, field)
+                gen.Emit(OpCodes.Ret)
+                ctr
+
+            if Array.length fields > 0 then
+                let ctr = subtype.DefineConstructor(MethodAttributes.Public, CallingConventions.Standard, [| |])
+                let gen = ctr.GetILGenerator()
+                gen.Emit(OpCodes.Ldarg_0)
+                gen.Emit(OpCodes.Call, baseDefaultConstructor)
+                gen.Emit(OpCodes.Ret)
+
+            begin
+                let attr = MethodAttributes.Public ||| MethodAttributes.Virtual
+                let extract = subtype.DefineMethod(extractBaseMethod.Name, attr, unionType, [| |])
+                subtype.DefineMethodOverride(extract, extractBaseMethod)
+                let gen = extract.GetILGenerator()
+                for field in fields do
+                    gen.Emit(OpCodes.Ldarg_0)
+                    gen.Emit(OpCodes.Ldfld, field)
+                    emitStackTopZeroCheck gen field.FieldType
+                gen.Emit(OpCodes.Call, FSharpValue.PreComputeUnionConstructorInfo(caseInfo, true))
+                gen.Emit(OpCodes.Ret)
+            end
+
+            struct (caseInfo, subtype, constructor)
+    |]
+
+    // Define op_Implicit methods that Protobuf calls to create unionType from surrogate.
+    let fromSurrogate =
+        let conv = surrogateType.DefineOpExplicit(surrogateType, unionType)
+        let gen = conv.GetILGenerator()
+        gen.Emit((if surrogateType.IsValueType then OpCodes.Ldarga_S else OpCodes.Ldarg), 0)
+        gen.Emit(OpCodes.Ldfld, surrogateItemField)
+        gen.Emit(OpCodes.Callvirt, extractBaseMethod)
+        gen.Emit(OpCodes.Ret)
+        conv
+
+    // Define op_Implicit methods that Protobuf calls to create surrogate from unionType.
+    let toSurrogate =
+        let conv = surrogateType.DefineOpExplicit(unionType, surrogateType)
+        let gen = conv.GetILGenerator()
+
+        let argIsNull = gen.DefineLabel()
+        if not unionType.IsValueType then
+            gen.Emit(OpCodes.Ldarg_0)
+            gen.Emit(OpCodes.Brfalse, argIsNull)
+
+        let jumpTable = Array.init (Array.length cases) (ignore >> gen.DefineLabel)
+
+        match FSharpValue.PreComputeUnionTagMemberInfo(unionType, true) with
+        | :? PropertyInfo as tag ->
+            gen.Emit((if unionType.IsValueType then OpCodes.Ldarga_S else OpCodes.Ldarg), 0)
+            gen.Emit(OpCodes.Call, tag.GetMethod)
+        | :? MethodInfo as tag when tag.IsStatic ->
+            gen.Emit(OpCodes.Call, tag)
+        | smth -> failwithf "Unexpected tag member: %A" smth
+        gen.Emit(OpCodes.Switch, jumpTable)
+
+        gen.MarkLabel(argIsNull)
+        gen.Emit(OpCodes.Ldnull)
+        gen.Emit(OpCodes.Newobj, surrogateConstructor)
+        gen.Emit(OpCodes.Ret)
+
+        for (caseInfo, _, caseConstructor) in cases do
+            gen.MarkLabel(jumpTable.[ caseInfo.Tag ])
+            for originField in caseInfo.GetFields() do
+                gen.Emit((if unionType.IsValueType then OpCodes.Ldarga_S else OpCodes.Ldarg), 0)
+                gen.Emit(OpCodes.Call, originField.GetMethod)
+            gen.Emit(OpCodes.Newobj, caseConstructor)
+            gen.Emit(OpCodes.Newobj, surrogateConstructor)
+            gen.Emit(OpCodes.Ret)
+
+        conv
+
+    for subtype in unionType.GetNestedTypes(BindingFlags.Public ||| BindingFlags.NonPublic) |> Seq.filter (fun sub -> sub.IsSubclassOf unionType) do
+        let conv = surrogateType.DefineOpExplicit(surrogateType, subtype)
+        let gen = conv.GetILGenerator()
+        gen.Emit(OpCodes.Ldarg_0)
+        gen.Emit(OpCodes.Call, fromSurrogate)
+        gen.Emit(OpCodes.Castclass, subtype)
+        gen.Emit(OpCodes.Ret)
+
+        let conv = surrogateType.DefineOpExplicit(subtype, surrogateType)
+        let gen = conv.GetILGenerator()
+        gen.Emit(OpCodes.Ldarg_0)
+        gen.Emit(OpCodes.Call, toSurrogate)
+        gen.Emit(OpCodes.Ret)
+
+    let surrogate = surrogateType.CreateTypeInfo ()
+    let subsBase = caseBaseType.CreateTypeInfo()
+    let subs = [|
+        for (tag, (_, t, _)) in Seq.indexed cases ->
+            //t.SetProtoIncludeAttribute(1000 + tag, subsBase)
+            t.CreateTypeInfo()
+    |]
+    struct (surrogate, subsBase, subs)
+
+
 [<RequireQualifiedAccess>]
 type internal TypeConstructionStrategy =
     | NoCustomConstructor // Uses default Protobuf-net behaviour
@@ -254,3 +425,15 @@ let getTypeConstructionMethod (typeToAdd : Type) (fields : FieldInfo[]) =
                 emitValueUnionSurrogate surrogateModule typeToAdd true |> TypeConstructionStrategy.ObjectSurrogate
             else emitFactory typeToAdd zeroValuesForFields |> TypeConstructionStrategy.CustomFactoryMethod
         )
+
+
+let private subCache = ConcurrentDictionary<Type, struct (TypeInfo * TypeInfo * TypeInfo[])>()
+
+let getUnionSurrogate (unionType : Type) =
+    subCache.GetOrAdd(unionType, fun _ ->
+        if not unionType.IsValueType then
+            emitUnionSurrogate' surrogateModule unionType
+        else
+            let t = emitValueUnionSurrogate surrogateModule unionType true
+            struct (t, null, [| |])
+    )

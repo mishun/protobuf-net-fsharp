@@ -8,6 +8,12 @@ open System.Reflection
 open System.IO
 
 module Serialiser =
+    let private registerSurrogate (tp : Type) (model : RuntimeTypeModel) =
+        let surrogateType = CodeGen.getSurrogate tp
+        match surrogateType.GetMethod("RegisterIntoModel") with
+        | null -> ()
+        | method -> method.Invoke(null, [| box model |]) |> ignore
+        surrogateType
 
     /// The magic number where if a union type has more than the above cases it simply is a tagged instance of the parent type.
     /// Otherwise for this number and below even non-empty unions get their own inner class prefixed with "_".
@@ -47,8 +53,8 @@ module Serialiser =
         let fields = typeToAdd.GetFields(BindingFlags.Public ||| BindingFlags.NonPublic ||| BindingFlags.Instance ||| BindingFlags.GetField)
         metaType.UseConstructor <- false
         match CodeGen.getTypeConstructionMethod typeToAdd fields with
-        | CodeGen.TypeConstructionStrategy.ObjectSurrogate surrogateType ->
-            metaType.SetSurrogate surrogateType
+        | CodeGen.TypeConstructionStrategy.ObjectSurrogate ->
+            registerSurrogate typeToAdd model |> metaType.SetSurrogate
         | CodeGen.TypeConstructionStrategy.CustomFactoryMethod factoryMethod ->
             addFieldsToMetaType metaType fields
             metaType.SetFactory factoryMethod |> ignore
@@ -56,14 +62,6 @@ module Serialiser =
             addFieldsToMetaType metaType fields
 
         for field in fields do registerOptionTypesIntoModel field.FieldType None model
-
-    let registerUnionRuntimeTypeIntoModel' (unionType: Type) (model: RuntimeTypeModel) =
-        let metaType = model.Add(unionType, true)
-        let surrogateType = CodeGen.getSurrogate unionType
-        metaType.SetSurrogate surrogateType
-        for subtype in CodeGen.relevantUnionSubtypes unionType do
-            model.Add(subtype, false).SetSurrogate(surrogateType)
-        model
 
     let registerUnionRuntimeTypeIntoModel (unionType: Type) (model: RuntimeTypeModel) =
         let unionCaseData = FSharpType.GetUnionCases(unionType, true)
@@ -116,6 +114,14 @@ module Serialiser =
                         caseTypeModel.Name <- ucd.Name
                         processFieldsAndCreateFieldSetters typeToAdd caseTypeModel model |> ignore
                     | None -> ()
+        model
+
+    let registerUnionRuntimeTypeIntoModel' (unionType: Type) (model: RuntimeTypeModel) =
+        let metaType = model.Add(unionType, false)
+        let surrogateType = registerSurrogate unionType model
+        metaType.SetSurrogate surrogateType
+        for subtype in CodeGen.relevantUnionSubtypes unionType do
+            model.Add(subtype, false).SetSurrogate(surrogateType)
         model
 
     let registerUnionIntoModel<'tunion> model = registerUnionRuntimeTypeIntoModel' typeof<'tunion> model

@@ -59,7 +59,7 @@ module Serialiser =
 
     let registerUnionRuntimeTypeIntoModel' (unionType: Type) (model: RuntimeTypeModel) =
         let metaType = model.Add(unionType, true)
-        let surrogateType = CodeGen.getUnionSurrogate unionType
+        let surrogateType = CodeGen.getSurrogate unionType
         metaType.SetSurrogate surrogateType
         for subtype in CodeGen.relevantUnionSubtypes unionType do
             model.Add(subtype, false).SetSurrogate(surrogateType)
@@ -118,7 +118,7 @@ module Serialiser =
                     | None -> ()
         model
 
-    let registerUnionIntoModel<'tunion> model = registerUnionRuntimeTypeIntoModel typeof<'tunion> model
+    let registerUnionIntoModel<'tunion> model = registerUnionRuntimeTypeIntoModel' typeof<'tunion> model
 
     let registerRecordRuntimeTypeIntoModel (runtimeType: Type) (model: RuntimeTypeModel) =
         let metaType = model.Add(runtimeType, false)

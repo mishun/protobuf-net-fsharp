@@ -90,6 +90,13 @@ type StructRecordWithNestedStructCollectionTypes = {
     Data: InnerNestedRecordWithCollections
 }
 
+[<Struct; TestName("Struct with generic")>]
+type GenericStruct<'t, 's> = {
+    Count : int
+    Data : 't[]
+    Data2 : 's
+}
+
 module TestRecordRoundtrip = 
 
     // F# does not allow nulls although FsCheck tries to stress C# interoperability.
@@ -128,7 +135,8 @@ module TestRecordRoundtrip =
 
     let buildTest<'t when 't : equality> = 
         let testNameAttribute = typeof<'t>.GetCustomAttributes(typeof<TestNameAttribute>, true) |> Seq.head :?> TestNameAttribute
-        testCase testNameAttribute.Name <| fun () -> Check.One(config, testRoundtrip<'t> testNameAttribute.DependentTypeParamters)
+        let name = sprintf "%s (%A)" testNameAttribute.Name typeof<'t>
+        testCase name <| fun () -> Check.One(config, testRoundtrip<'t> testNameAttribute.DependentTypeParamters)
 
     let manualTestCases = [
         testCase "Can serialise empty array, string and option" <| fun () -> testRoundtrip [||] { One = ""; Two = 1; Three = [||]; Four = None } 
@@ -151,5 +159,9 @@ module TestRecordRoundtrip =
               yield buildTest<StructRecordWithCollectionTestCases>
               yield buildTest<StructRecordWithNestedTypes>
               yield buildTest<StructRecordWithNestedStructCollectionTypes>
+              yield buildTest<GenericStruct<string, int>>
+              yield buildTest<GenericStruct<string, string>>
+              yield buildTest<GenericStruct<string, byte[]>>
+              //yield buildTest<GenericStruct<int, string list>>
               yield! manualTestCases
             ]

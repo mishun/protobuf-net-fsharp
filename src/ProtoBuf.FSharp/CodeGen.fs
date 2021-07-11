@@ -1,10 +1,12 @@
 module internal ProtoBuf.FSharp.CodeGen
 
 open System
-open FSharp.Reflection
 open System.Collections.Concurrent
+open System.Collections.Generic
+open System.Threading
 open System.Reflection
 open System.Reflection.Emit
+open FSharp.Reflection
 open MethodHelpers
 
 
@@ -93,6 +95,10 @@ let private emitRecordDefault (gen: ILGenerator) (recordType: Type) =
 
     let ctr = FSharpValue.PreComputeRecordConstructorInfo(recordType, true)
     gen.Emit(OpCodes.Newobj, ctr)
+
+
+let mutable private uniqueNameCounter = 0L
+
 
 /// Emits a factory to create the object making sure all values are default assigned as expected for F# consumption (e.g. no nulls where not possible to define for common cases)
 let private emitFactory (resultType : Type) (zeroValuesPerField: ZeroValues.FieldWithZeroValueSetMethod array) =
@@ -211,12 +217,10 @@ let private emitRecordSurrogate (surrogateModule: ModuleBuilder) (recordType: Ty
     surrogateType.CreateTypeInfo()
 
 let private emitGetUnionTag (gen : ILGenerator) (unionType: Type) =
+    gen.Emit((if unionType.IsValueType then OpCodes.Ldarga_S else OpCodes.Ldarg), 0)
     match FSharpValue.PreComputeUnionTagMemberInfo(unionType, true) with
-    | :? PropertyInfo as tag ->
-        gen.Emit((if unionType.IsValueType then OpCodes.Ldarga_S else OpCodes.Ldarg), 0)
-        gen.Emit(OpCodes.Call, tag.GetMethod)
-    | :? MethodInfo as tag when tag.IsStatic ->
-        gen.Emit(OpCodes.Call, tag)
+    | :? PropertyInfo as tag -> gen.Emit(OpCodes.Call, tag.GetMethod)
+    | :? MethodInfo as tag-> gen.Emit(OpCodes.Call, tag)
     | smth -> failwithf "Unexpected tag member: %A" smth
 
 let relevantUnionSubtypes (unionType: Type) = seq {
@@ -238,19 +242,20 @@ let private emitUnionSurrogateWithTag (surrogateModule: ModuleBuilder) (unionTyp
     defineGenericArgs genericArgs surrogateType
     surrogateType.SetProtoContractAttribute(false)
 
-    let unionCases = FSharpType.GetUnionCases(unionType, true)
-
-    let tagEnum = surrogateType.DefineNestedType("TagsForCases", TypeAttributes.NestedPublic ||| TypeAttributes.Sealed, typeof<Enum>, null)
+    let tagEnum =
+        let name = sprintf "UnionTags%i" (Interlocked.Increment &uniqueNameCounter)
+        surrogateType.DefineNestedType(name, TypeAttributes.NestedPublic ||| TypeAttributes.Sealed, typeof<Enum>, null)
     tagEnum.DefineField("value__", typeof<int>, FieldAttributes.Private ||| FieldAttributes.SpecialName) |> ignore
-    for caseInfo in unionCases do
-        tagEnum.DefineField(caseInfo.Name, tagEnum, FieldAttributes.Public ||| FieldAttributes.Literal ||| FieldAttributes.Static).SetConstant(caseInfo.Tag)
-    tagEnum.CreateTypeInfo() |> ignore
 
     let surrogateTagField = surrogateType.DefineField("Tag", tagEnum, FieldAttributes.Public)
     surrogateTagField.SetProtoMemberAttribute(1)
 
     let cases = [|
-        for caseInfo in unionCases ->
+        for caseInfo in FSharpType.GetUnionCases(unionType, true) ->
+            let enumCase =
+                let name = sprintf "%s_%s" tagEnum.Name caseInfo.Name
+                tagEnum.DefineField(name, tagEnum, FieldAttributes.Public ||| FieldAttributes.Literal ||| FieldAttributes.Static)
+            enumCase.SetConstant(caseInfo.Tag)
             let caseData =
                 match caseInfo.GetFields() with
                 | [||] -> ValueNone
@@ -264,7 +269,6 @@ let private emitUnionSurrogateWithTag (surrogateModule: ModuleBuilder) (unionTyp
                     let struct (constructor, extractMethod) =
                         emitSurrogateContent subtype unionType caseFields (FSharpValue.PreComputeUnionConstructorInfo(caseInfo, true)) false null
                     subtype.CreateTypeInfo() |> ignore
-
                     let caseDataField = surrogateType.DefineField("Data" + caseInfo.Name, subtype, FieldAttributes.Public)
                     caseDataField.SetProtoMemberAttribute(2 + caseInfo.Tag)
                     struct (caseDataField, constructor, extractMethod) |> ValueSome
@@ -283,12 +287,11 @@ let private emitUnionSurrogateWithTag (surrogateModule: ModuleBuilder) (unionTyp
         for (caseInfo, caseStructure) in cases do
             gen.MarkLabel(jumpTable.[ caseInfo.Tag ])
             match caseStructure with
+            | ValueNone -> gen.Emit(OpCodes.Call, FSharpValue.PreComputeUnionConstructorInfo(caseInfo, true))
             | ValueSome struct (caseDataField, _, extractMethod) ->
                 gen.Emit(OpCodes.Ldarga_S, 0)
                 gen.Emit(OpCodes.Ldfld, caseDataField)
                 gen.Emit(OpCodes.Call, extractMethod)
-            | ValueNone ->
-                gen.Emit(OpCodes.Call, FSharpValue.PreComputeUnionConstructorInfo(caseInfo, true))
             gen.Emit(OpCodes.Ret)
         conv
 
@@ -339,6 +342,7 @@ let private emitUnionSurrogateWithTag (surrogateModule: ModuleBuilder) (unionTyp
             .GetILGenerator()
             .Emit(OpCodes.Jmp, toSurrogate)
 
+    tagEnum.CreateTypeInfo() |> ignore
     surrogateType.CreateTypeInfo ()
 
 let private emitUnionSurrogateWithSubtypes (surrogateModule: ModuleBuilder) (unionType: Type) =
@@ -464,17 +468,20 @@ let private emitUnionSurrogateWithSubtypes (surrogateModule: ModuleBuilder) (uni
 
 let private surrogateAssembly = AssemblyBuilder.DefineDynamicAssembly(AssemblyName("SurrogateAssembly"), AssemblyBuilderAccess.Run)
 let private surrogateModule = surrogateAssembly.DefineDynamicModule "SurrogateModule"
-let private surrogateCache = ConcurrentDictionary<Type, Lazy<TypeInfo>>()
+let private surrogateCache =
+    ConcurrentDictionary<Type, Lazy<Type>> (seq {
+        KeyValuePair(typedefof<Option<_>>, lazy typedefof<Surrogates.Optional<_>>)
+    })
 
 let private makeSurrogate (typeToAdd : Type) =
     match typeToAdd with
     | t when FSharpType.IsUnion(t, true) ->
         if t.IsValueType then
-            lazy (emitUnionSurrogateWithTag surrogateModule typeToAdd)
+            lazy (emitUnionSurrogateWithTag surrogateModule typeToAdd :> Type)
         else
-            lazy (emitUnionSurrogateWithSubtypes surrogateModule typeToAdd)
+            lazy (emitUnionSurrogateWithSubtypes surrogateModule typeToAdd :> Type)
     | t when FSharpType.IsRecord(t, true) ->
-        lazy emitRecordSurrogate surrogateModule typeToAdd true
+        lazy (emitRecordSurrogate surrogateModule typeToAdd true :> Type)
     | t ->
         failwithf "No surrogate construction method for type %A" t
 
@@ -483,26 +490,10 @@ let getSurrogate (typeToAdd : Type) =
         let surrogateDef = surrogateCache.GetOrAdd(typeToAdd.GetGenericTypeDefinition(), makeSurrogate).Value
         surrogateDef.MakeGenericType(typeToAdd.GetGenericArguments())
     else
-        surrogateCache.GetOrAdd(typeToAdd, makeSurrogate).Value :> Type
+        surrogateCache.GetOrAdd(typeToAdd, makeSurrogate).Value
 
-
-[<RequireQualifiedAccess>]
-type internal TypeConstructionStrategy =
-    | NoCustomConstructor // Uses default Protobuf-net behaviour
-    | CustomFactoryMethod of factoryMethod : MethodInfo
-    | ObjectSurrogate
 
 let private factoryCache = ConcurrentDictionary<Type, Lazy<MethodInfo>>()
 
-let getTypeConstructionMethod (typeToAdd : Type) (fields : FieldInfo[]) =
-    match ZeroValues.calculateApplicableFields fields with
-    | [| |] -> TypeConstructionStrategy.NoCustomConstructor
-    | zeroValuesForFields ->
-        match typeToAdd with
-        | t when t.IsValueType && FSharpType.IsRecord(t, true) ->
-            TypeConstructionStrategy.ObjectSurrogate
-        | t when t.IsValueType && FSharpType.IsUnion(t, true) ->
-            TypeConstructionStrategy.ObjectSurrogate
-        | _ ->
-            let factory = factoryCache.GetOrAdd(typeToAdd, fun _ -> lazy emitFactory typeToAdd zeroValuesForFields).Value
-            TypeConstructionStrategy.CustomFactoryMethod factory
+let getFactory (typeToAdd : Type) zeroValuesForFields =
+    factoryCache.GetOrAdd(typeToAdd, fun _ -> lazy emitFactory typeToAdd zeroValuesForFields).Value
